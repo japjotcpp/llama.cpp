@@ -176,11 +176,8 @@ if (CUDAToolkit_FOUND)
         target_link_libraries(ggml-cuda PRIVATE CUDA::cudart CUDA::cublas CUDA::cublasLt)
     endif()
 
-    if (GGML_CUDA_NO_VMM)
-        # No VMM requested, no need to link directly with the cuda driver lib (libcuda.so)
-    else()
-        target_link_libraries(ggml-cuda PRIVATE CUDA::cuda_driver)
-    endif()
+    # The optional SASS ADD module also uses the driver API when VMM is disabled.
+    target_link_libraries(ggml-cuda PRIVATE CUDA::cuda_driver)
 
     if (GGML_CUDA_NCCL)
         find_package(NCCL)

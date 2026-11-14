@@ -12,6 +12,7 @@
 #include "ggml-cuda/argsort.cuh"
 #include "ggml-cuda/batch-get.cuh"
 #include "ggml-cuda/binbcast.cuh"
+#include "ggml-cuda/sass-packed.cuh"
 #include "ggml-cuda/clamp.cuh"
 #include "ggml-cuda/col2im-1d.cuh"
 #include "ggml-cuda/concat.cuh"
@@ -84,6 +85,7 @@
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <cfloat>
 #include <initializer_list>
 #include <limits>
@@ -790,7 +792,101 @@ ggml_backend_cuda_context::ggml_backend_cuda_context(int device) :
     device(device),
     name(GGML_CUDA_NAME + std::to_string(device)),
     concurrent_stream_context(std::make_unique<ggml_cuda_stream_context>()) {
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    ggml_cuda_sass_packed_init(this);
+    const char * path = std::getenv("GGML_CUDA_SASS_ADD_CUBIN");
+    if (path != nullptr && path[0] != '\0') {
+        if (ggml_cuda_info().devices[device].cc != GGML_CUDA_CC_TURING) {
+            GGML_LOG_WARN("%s: SASS ADD requires SM75; using standard kernels on device %d\n", __func__, device);
+            return;
+        }
+        const char * trace = std::getenv("GGML_CUDA_SASS_TRACE");
+        sass_add_trace = trace != nullptr && std::strcmp(trace, "0") != 0;
+        ggml_cuda_set_device(device);
+        CUDA_CHECK(cudaFree(nullptr));
+        CU_CHECK(cuCtxGetCurrent(&sass_add_context));
+        // Load before graph capture, in the runtime's existing context.
+        CUresult result = cuModuleLoad(&sass_add_module, path);
+        if (result == CUDA_SUCCESS) {
+            result = cuModuleGetFunction(&sass_add_kernel, sass_add_module, "vector_add");
+        }
+        int binary_version = 0;
+        if (result == CUDA_SUCCESS) {
+            result = cuFuncGetAttribute(&binary_version, CU_FUNC_ATTRIBUTE_BINARY_VERSION, sass_add_kernel);
+        }
+        if (result != CUDA_SUCCESS || binary_version != 75) {
+            GGML_LOG_WARN("%s: cannot enable SM75 SASS ADD from '%s' (%s, binary version %d); using standard kernels\n",
+                          __func__, path, cu_get_error_str(result), binary_version);
+            if (sass_add_module != nullptr) {
+                CU_CHECK(cuModuleUnload(sass_add_module));
+            }
+            sass_add_module = nullptr;
+            sass_add_kernel = nullptr;
+            sass_add_context = nullptr;
+            return;
+        }
+        GGML_LOG_INFO("%s: experimental SM75 SASS ADD enabled from '%s' on device %d\n", __func__, path, device);
+    }
+#endif
 }
+
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+bool ggml_backend_cuda_context::try_sass_add(ggml_tensor * dst) {
+    if (sass_add_kernel == nullptr) {
+        return false;
+    }
+    const ggml_tensor * src0 = dst->src[0];
+    const ggml_tensor * src1 = dst->src[1];
+    if (src0 == nullptr || src1 == nullptr || dst->type != GGML_TYPE_F32 ||
+        src0->type != GGML_TYPE_F32 || src1->type != GGML_TYPE_F32 ||
+        !ggml_are_same_shape(src0, dst) || !ggml_are_same_shape(src1, dst)) {
+        return false;
+    }
+    int64_t count = 1;
+    for (int i = 0; i < GGML_MAX_DIMS; ++i) {
+        if (dst->ne[i] < 0 || dst->ne[i] > INT32_MAX / count) {
+            return false;
+        }
+        if (dst->ne[i] == 0) {
+            return true;
+        }
+        count *= dst->ne[i];
+    }
+    if (uint64_t(count) > std::numeric_limits<size_t>::max() / sizeof(float) ||
+        !ggml_is_contiguous(src0) || !ggml_is_contiguous(src1) || !ggml_is_contiguous(dst)) {
+        return false;
+    }
+    const size_t bytes = size_t(count) * sizeof(float);
+    const uintptr_t output = reinterpret_cast<uintptr_t>(dst->data);
+    for (const ggml_tensor * src : {src0, src1}) {
+        const uintptr_t input = reinterpret_cast<uintptr_t>(src->data);
+        if (input == 0 || output == 0 || input % alignof(float) != 0 || output % alignof(float) != 0) {
+            return false;
+        }
+        if (input != output && ((input > output && input - output < bytes) || (output > input && output - input < bytes))) {
+            return false;
+        }
+    }
+    CUcontext current = nullptr;
+    CU_CHECK(cuCtxGetCurrent(&current));
+    if (current != sass_add_context) {
+        return false;
+    }
+    const void * a = src0->data;
+    const void * b = src1->data;
+    void * out = dst->data;
+    int32_t n = int32_t(count);
+    void * params[] = {&a, &b, &out, &n};
+    const unsigned int block = 256;
+    const unsigned int grid = (uint32_t(n) + block - 1) / block;
+    CU_CHECK(cuLaunchKernel(sass_add_kernel, grid, 1, 1, block, 1, 1, 0, stream(), params, nullptr));
+    const uint64_t dispatches = sass_add_dispatches.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (sass_add_trace && dispatches == 1) {
+        GGML_LOG_INFO("%s: SASS ADD host dispatch device=%d n=%d; graph capture counts as a dispatch\n", __func__, device, n);
+    }
+    return true;
+}
+#endif
 
 #ifdef USE_CUDA_GRAPH
 ggml_cuda_graph * ggml_backend_cuda_context::cuda_graph(const void * first_node_ptr, int64_t time_now) {
@@ -914,6 +1010,25 @@ static std::atomic<int> ggml_cuda_lock_counter;
 ggml_backend_cuda_context::~ggml_backend_cuda_context() {
     std::unique_lock<std::mutex> lock(ggml_cuda_lock);
     ggml_cuda_lock_cv.wait(lock, []{ return ggml_cuda_lock_counter.load(std::memory_order_relaxed) == 0; });
+
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    ggml_cuda_sass_packed_free(this);
+    if (sass_add_module != nullptr) {
+        CU_CHECK(cuCtxPushCurrent(sass_add_context));
+        CU_CHECK(cuCtxSynchronize());
+#ifdef USE_CUDA_GRAPH
+        // Captured kernels must be destroyed before their module is unloaded.
+        cuda_graphs.clear();
+#endif
+        CU_CHECK(cuModuleUnload(sass_add_module));
+        CUcontext previous = nullptr;
+        CU_CHECK(cuCtxPopCurrent(&previous));
+        if (sass_add_trace) {
+            GGML_LOG_INFO("%s: SASS ADD device=%d host_dispatches=%" PRIu64 " (includes captures; excludes graph replays)\n",
+                          __func__, device, sass_add_dispatches.load(std::memory_order_relaxed));
+        }
+    }
+#endif
 
     if (copy_event != nullptr) {
         CUDA_CHECK(cudaEventDestroy(copy_event));
@@ -2707,6 +2822,10 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
 
 static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct ggml_tensor * dst) {
     switch (dst->op) {
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+        case GGML_OP_CUSTOM:
+            return ggml_cuda_sass_packed_compute(ctx, dst);
+#endif
         case GGML_OP_ARGMAX:
             ggml_cuda_argmax(ctx, dst);
             break;
@@ -6210,6 +6329,10 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
     }
 
     switch (op->op) {
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+        case GGML_OP_CUSTOM:
+            return ggml_cuda_sass_packed_supports(op, dev_ctx->device);
+#endif
         case GGML_OP_UNARY:
             switch (ggml_get_unary_op(op)) {
                 case GGML_UNARY_OP_ABS:

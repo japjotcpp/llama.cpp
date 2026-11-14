@@ -313,6 +313,25 @@ Currently supported values: `auto`, `q8`, `q4`.
 
 NVFP4 and MXFP4 layers marked as W4A16 request 8-bit activations, so on Blackwell those layers run through the W4A8 path instead of the native W4A4 path. Set `q4` to keep the native W4A4 path for faster prompt processing at the cost of accuracy, or `q8` to use the W4A8 path for every layer, `auto` uses per-tensor prec metadata (this is the same behavior as when the environment variable is not set).
 
+### Experimental SM75 SASS ADD
+
+This fork can load a separately assembled ADD kernel on Turing GPUs. Set `GGML_CUDA_SASS_ADD_CUBIN` to a trusted SM75 cubin exporting `vector_add(const float * a, const float * b, float * out, int32_t n)`. The kernel must implement elementwise FP32 addition, bounds checks, and exact input/output aliasing for a one-dimensional launch with 256 threads per block. The cubin is executable device code supplied by the user; its name and architecture checks do not validate its behavior or parameter ABI.
+
+Use `FADD.FTZ` to match this backend's `-use_fast_math` build: subnormal operands and results flush to signed zero. The ordinary non-FTZ `vector_add` example has different subnormal behavior. In the sass-lab checkout, build the dedicated variant with `.venv/bin/python examples/build_llama_add.py -o build/llama_add.cubin`. Its patch is checked against independent default/fast-math compiler fixtures, and its optional GPU tests compare against CUDA fast-math output for subnormals, signed zeros, infinities, and NaNs.
+
+The hook handles contiguous, equal-shaped FP32 tensors with at most `INT32_MAX` elements. Broadcasts, strided tensors, other types, other GPUs, and partial input/output overlap use the normal CUDA path. An unset variable leaves dispatch unchanged. Missing or incompatible cubins produce a warning and use the normal path. This is an integration experiment, with no inference speed claim.
+
+The module loads during backend initialization in the existing CUDA context, before graph capture. CUDA graphs and active work finish before module unload. The CUDA build links the driver library even when `GGML_CUDA_NO_VMM=ON`; HIP and MUSA do not use this hook.
+
+Set `GGML_CUDA_SASS_TRACE=1` to log the first host dispatch and a total at backend destruction. These counts include graph capture and exclude subsequent graph replays; they are not GPU execution counters.
+
+```sh
+GGML_CUDA_SASS_ADD_CUBIN=/absolute/path/sass-lab/build/llama_add.cubin GGML_CUDA_SASS_TRACE=1 \
+    build/bin/test-backend-ops -b CUDA0 -o ADD
+```
+
+Run backend tests both with and without the variable, including broadcasting and non-FP32 cases. Model integration also needs output comparisons and graph-replay tests against the normal CUDA backend.
+
 ### Unified Memory
 
 The environment variable `GGML_CUDA_ENABLE_UNIFIED_MEMORY=1` can be used to enable unified memory in Linux. This allows swapping to system RAM instead of crashing when the GPU VRAM is exhausted. In Windows this setting is available in the NVIDIA control panel as `System Memory Fallback`.
@@ -904,3 +923,44 @@ The GPU may still be used to accelerate some parts of the computation even when 
 In most cases, it is possible to build and use multiple backends at the same time. For example, you can build llama.cpp with both CUDA and Vulkan support by using the `-DGGML_CUDA=ON -DGGML_VULKAN=ON` options with CMake. At runtime, you can specify which backend devices to use with the `--device` option. To see a list of available devices, use the `--list-devices` option.
 
 Backends can be built as dynamic libraries that can be loaded dynamically at runtime. This allows you to use the same llama.cpp binary on different machines with different GPUs. To enable this feature, use the `GGML_BACKEND_DL` option when building.
+
+### Experimental packed binary graph API (SM75 fork)
+
+`ggml-cuda-sass.h` provides `ggml_cuda_sass_binary_matmul` and
+`ggml_cuda_sass_binary_linear`. These create typed ggml custom graph nodes with a
+CPU reference callback. Packed factors stay I32, with one row per output and
+`ceil(input_width / 32)` little-endian words per row. The least significant bit
+represents the first input; bit one means -1, zero means +1. Inputs, output, and
+scale vectors are FP32. Both one token and multiple columns of tokens are
+supported; the current GPU implementation launches one kernel per token.
+
+To enable CUDA execution, set `GGML_CUDA_SASS_BINARY_CUBIN` to the absolute path
+of the independently built `littlebit_dot.cubin` before backend initialization.
+The kernel must export `binary_dot(packed, input, output, int rows, int cols)`.
+Modules are loaded before graph capture and unloaded after captured graphs are
+destroyed. This is trusted executable code, so use a cubin you built and checked.
+Unsupported devices or an absent module leave these nodes on the CPU when using
+the normal ggml scheduler. Direct CUDA-only graph execution requires support.
+
+The linear helper composes `u1 * U * ((v1*u2) * (V * (v2*x)))` using the packed
+custom nodes and ordinary ggml multiplication. Residual branches and bias can be
+composed with ordinary addition. This API does not load LittleBit safetensors or
+modify a standard Qwen GGUF graph: a checkpoint converter and model-loader graph
+integration are still required for that path. It makes no speed claim.
+
+A standalone graph parity test is provided in `tests/test-cuda-sass-packed.cpp`.
+After building with CUDA enabled, compile it against the build's shared libraries:
+
+```sh
+c++ -std=c++17 -Iggml/include tests/test-cuda-sass-packed.cpp \
+    -Lbuild/bin -Wl,-rpath,"$PWD/build/bin" \
+    -lggml-cuda -lggml-cpu -lggml-base -lggml \
+    -o build/bin/test-cuda-sass-packed
+GGML_CUDA_SASS_BINARY_CUBIN=/absolute/path/littlebit_dot.cubin \
+    GGML_CUDA_SASS_TRACE=1 build/bin/test-cuda-sass-packed
+```
+
+The test compares CPU and CUDA packed dot and two-factor graphs across partial
+words, multiple tokens, and five executions with changing input. The library
+search path must also include your CUDA runtime libraries if they are not installed
+in the system loader path.

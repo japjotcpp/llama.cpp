@@ -22,6 +22,7 @@
 #include "ggml-common.h"
 
 #include <array>
+#include <atomic>
 #include <algorithm>
 #include <cassert>
 #include <cfloat>
@@ -238,7 +239,7 @@ void ggml_cuda_error(const char * stmt, const char * func, const char * file, in
 #define NCCL_CHECK(err) CUDA_CHECK_GEN(err, ncclSuccess, ncclGetErrorString)
 #endif // GGML_USE_NCCL
 
-#if !defined(GGML_USE_HIP) && !defined(GGML_CUDA_NO_VMM)
+#if !defined(GGML_USE_HIP) && (!defined(GGML_USE_MUSA) || !defined(GGML_CUDA_NO_VMM))
 static const char * cu_get_error_str(CUresult err) {
     const char * err_str;
     cuGetErrorString(err, &err_str);
@@ -1353,6 +1354,16 @@ struct ggml_backend_cuda_context {
     int device;
     std::string name;
     cudaEvent_t copy_event = nullptr;
+
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    CUmodule sass_add_module = nullptr;
+    CUfunction sass_add_kernel = nullptr;
+    CUcontext sass_add_context = nullptr;
+    std::atomic<uint64_t> sass_add_dispatches{0};
+    bool sass_add_trace = false;
+
+    bool try_sass_add(ggml_tensor * dst);
+#endif
 
     cudaStream_t streams[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = {};
     cublasHandle_t cublas_handles[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = {};
