@@ -12,8 +12,59 @@ void llama_model_qwen3::load_arch_hparams(llama_model_loader & ml) {
     }
 }
 
-void llama_model_qwen3::load_arch_tensors(llama_model_loader &) {
+void llama_model_qwen3::load_arch_tensors(llama_model_loader & ml) {
     LLAMA_LOAD_LOCALS;
+    uint32_t littlebit_version = 0;
+    ml.get_key("qwen3.littlebit.version", littlebit_version, false);
+    if (littlebit_version > 1) {
+        throw std::runtime_error("unsupported Qwen3 LittleBit storage version");
+    }
+#ifndef LLAMA_SASS_SM75
+    if (littlebit_version != 0) {
+        throw std::runtime_error("LittleBit Qwen3 requires the experimental CUDA SASS build");
+    }
+#endif
+    auto projection = [&](llm_tensor tensor, int layer, int64_t input, int64_t output) -> ggml_tensor * {
+        if (littlebit_version == 0) {
+            return create_tensor(tn(tensor, "weight", layer), {input, output}, 0);
+        }
+        llama_littlebit_projection p;
+        auto branch = [&](const char * suffix, llama_littlebit_branch & b, bool required) {
+            const std::string prefix = std::string("littlebit.") + suffix;
+            const std::string vname = prefix + "v";
+            const ggml_tensor * meta = ml.get_tensor_meta(tn(tensor, vname.c_str(), layer).str().c_str());
+            if (meta == nullptr && !required) {
+                return;
+            }
+            if (meta == nullptr || meta->type != GGML_TYPE_I32 || meta->ne[0] != (input + 31) / 32 ||
+                meta->ne[1] < 1 || meta->ne[1] > INT32_MAX / 32 || meta->ne[2] != 1 || meta->ne[3] != 1) {
+                throw std::runtime_error("invalid LittleBit packed V shape/type");
+            }
+            const int64_t rank = meta->ne[1];
+            auto load = [&](const char * name, std::initializer_list<int64_t> shape, ggml_type type) {
+                const std::string field = prefix + name;
+                ggml_tensor * result = create_tensor(tn(tensor, field.c_str(), layer), shape, 0);
+                if (result->type != type) {
+                    throw std::runtime_error("invalid LittleBit tensor storage type");
+                }
+                return result;
+            };
+            b.v = load("v", {(input + 31) / 32, rank}, GGML_TYPE_I32);
+            b.u = load("u", {(rank + 31) / 32, output}, GGML_TYPE_I32);
+            b.v2 = load("v2", {input}, GGML_TYPE_F32);
+            b.v1 = load("v1", {rank}, GGML_TYPE_F32);
+            b.u2 = load("u2", {rank}, GGML_TYPE_F32);
+            b.u1 = load("u1", {output}, GGML_TYPE_F32);
+        };
+        branch("", p.main, true);
+        branch("residual.", p.residual, false);
+        p.bias = create_tensor(tn(tensor, "littlebit.bias", layer), {output}, TENSOR_NOT_REQUIRED);
+        if (p.bias != nullptr && p.bias->type != GGML_TYPE_F32) {
+            throw std::runtime_error("LittleBit bias must be FP32");
+        }
+        littlebit_projections.emplace(p.main.v, p);
+        return p.main.v;
+    };
 
     tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab}, 0);
 
@@ -37,16 +88,22 @@ void llama_model_qwen3::load_arch_tensors(llama_model_loader &) {
 
         layer.attn_norm = create_tensor(tn(LLM_TENSOR_ATTN_NORM, "weight", i), {n_embd}, 0);
 
-        create_tensor_qkv(layer, i, n_embd, n_embd_head_k * n_head, n_embd_gqa, n_embd_gqa, 0);
-        layer.wo = create_tensor(tn(LLM_TENSOR_ATTN_OUT, "weight", i), {n_embd_head_k * n_head, n_embd}, 0);
+        if (littlebit_version == 0) {
+            create_tensor_qkv(layer, i, n_embd, n_embd_head_k * n_head, n_embd_gqa, n_embd_gqa, 0);
+        } else {
+            layer.wq = projection(LLM_TENSOR_ATTN_Q, i, n_embd, n_embd_head_k * n_head);
+            layer.wk = projection(LLM_TENSOR_ATTN_K, i, n_embd, n_embd_gqa);
+            layer.wv = projection(LLM_TENSOR_ATTN_V, i, n_embd, n_embd_gqa);
+        }
+        layer.wo = projection(LLM_TENSOR_ATTN_OUT, i, n_embd_head_k * n_head, n_embd);
 
         layer.attn_k_norm = create_tensor(tn(LLM_TENSOR_ATTN_K_NORM, "weight", i), {n_embd_head_k}, 0);
         layer.attn_q_norm = create_tensor(tn(LLM_TENSOR_ATTN_Q_NORM, "weight", i), {n_embd_head_k}, 0);
 
         layer.ffn_norm = create_tensor(tn(LLM_TENSOR_FFN_NORM, "weight", i), {n_embd}, 0);
-        layer.ffn_gate = create_tensor(tn(LLM_TENSOR_FFN_GATE, "weight", i), {n_embd,   n_ff}, 0);
-        layer.ffn_down = create_tensor(tn(LLM_TENSOR_FFN_DOWN, "weight", i), {  n_ff, n_embd}, 0);
-        layer.ffn_up   = create_tensor(tn(LLM_TENSOR_FFN_UP,   "weight", i), {n_embd,   n_ff}, 0);
+        layer.ffn_gate = projection(LLM_TENSOR_FFN_GATE, i, n_embd, n_ff);
+        layer.ffn_down = projection(LLM_TENSOR_FFN_DOWN, i, n_ff, n_embd);
+        layer.ffn_up   = projection(LLM_TENSOR_FFN_UP, i, n_embd, n_ff);
     }
 }
 

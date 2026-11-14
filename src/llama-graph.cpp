@@ -1,3 +1,6 @@
+#ifdef LLAMA_SASS_SM75
+#include "ggml-cuda-sass.h"
+#endif
 #include "llama-graph.h"
 
 #include "llama-impl.h"
@@ -1684,6 +1687,34 @@ ggml_tensor * llm_graph_context::build_lora_mm(
           ggml_tensor * w,
           ggml_tensor * cur,
           ggml_tensor * w_s) const {
+#ifdef LLAMA_SASS_SM75
+    const auto packed = model.littlebit_projections.find(w);
+    if (packed != model.littlebit_projections.end()) {
+        if (!loras->empty() || w_s != nullptr) {
+            throw std::runtime_error("LoRA/extra weight scales are unsupported for LittleBit projections");
+        }
+        ggml_tensor * input = cur->type == GGML_TYPE_F32 ? cur : ggml_cast(ctx0, cur, GGML_TYPE_F32);
+        if (!ggml_is_contiguous(input)) {
+            input = ggml_cont(ctx0, input);
+        }
+        const auto & p = packed->second;
+        auto branch = [&](const llama_littlebit_branch & b) {
+            ggml_tensor * result = ggml_cuda_sass_binary_linear(ctx0, b.u, b.v, input, b.u1, b.u2, b.v1, b.v2);
+            if (result == nullptr) {
+                throw std::runtime_error("invalid LittleBit projection activation shape");
+            }
+            return result;
+        };
+        ggml_tensor * result = branch(p.main);
+        if (p.residual.v != nullptr) {
+            result = ggml_add(ctx0, result, branch(p.residual));
+        }
+        if (p.bias != nullptr) {
+            result = ggml_add(ctx0, result, p.bias);
+        }
+        return result;
+    }
+#endif
     // a Hadamard-folded weight reads the transformed input; a LoRA delta lives in the primal basis and reads `cur`
     ggml_tensor * cur_mm = build_hadamard_input(w, cur);
     ggml_tensor * res = ggml_mul_mat(ctx0, w, cur_mm);

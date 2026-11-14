@@ -964,3 +964,28 @@ The test compares CPU and CUDA packed dot and two-factor graphs across partial
 words, multiple tokens, and five executions with changing input. The library
 search path must also include your CUDA runtime libraries if they are not installed
 in the system loader path.
+
+### Experimental packed Qwen3 model loader
+
+This fork also recognizes the explicit GGUF metadata key
+`qwen3.littlebit.version = 1`. The accompanying sass-lab converter writes the
+checkpoint's actual packed I32 U/V factors, FP32 scale vectors and optional
+residual/bias tensors under `blk.N.PROJECTION.littlebit.*`. The normal dense
+projection weights are absent. The Qwen3 loader validates these shapes and uses
+an explicit projection map so only those graph multiplications become packed
+custom operations. A standard Qwen3 GGUF continues using the original path.
+LoRA adapters on packed projections are currently rejected.
+
+The embedding and output head remain real dense weights. The converter can
+substitute an explicitly provided, independently quantized output-head GGUF;
+this changes numerical behavior and needs separate model-quality evaluation.
+The other dense checkpoint matrices are converted to FP16, norms/scales to FP32.
+Factor accumulation and intermediate activations use FP32, so this is not a
+bitwise reproduction of a Transformers model using FP16 activations.
+
+The custom format requires this fork and CUDA build; stock llama.cpp will reject
+its absent dense projection weights. The converter takes an explicit GGUF donor
+for tokenizer metadata and checks its architecture dimensions against the
+checkpoint config. Use a donor from the exact same Qwen3 vocabulary/model family.
+Set `GGML_CUDA_SASS_BINARY_CUBIN` before backend creation to enable authored SASS
+projection kernels. Without it the scheduler may use the slow CPU reference.

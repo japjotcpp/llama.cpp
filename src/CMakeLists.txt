@@ -77,3 +77,9 @@ if (BUILD_SHARED_LIBS)
     target_compile_definitions(llama PRIVATE LLAMA_BUILD)
     target_compile_definitions(llama PUBLIC  LLAMA_SHARED)
 endif()
+
+# Experimental packed Qwen3 graph API is supplied by this fork's CUDA backend.
+if (TARGET ggml-cuda)
+    target_link_libraries(llama PRIVATE ggml-cuda)
+    target_compile_definitions(llama PRIVATE LLAMA_SASS_SM75)
+endif()

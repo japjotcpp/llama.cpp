@@ -765,7 +765,24 @@ struct llama_rope_params {
     ggml_tensor * k_norm  = nullptr; // K norm weight applied after RoPE, a K-shift has to undo it
 };
 
+struct llama_littlebit_branch {
+    ggml_tensor * u = nullptr;
+    ggml_tensor * v = nullptr;
+    ggml_tensor * u1 = nullptr;
+    ggml_tensor * u2 = nullptr;
+    ggml_tensor * v1 = nullptr;
+    ggml_tensor * v2 = nullptr;
+};
+
+struct llama_littlebit_projection {
+    llama_littlebit_branch main;
+    llama_littlebit_branch residual;
+    ggml_tensor * bias = nullptr;
+};
+
 struct llama_model {
+    // Explicit packed projection identities; these are never dense matrix proxies.
+    std::map<const ggml_tensor *, llama_littlebit_projection> littlebit_projections;
     llm_type type = LLM_TYPE_UNKNOWN;
     llm_arch arch = LLM_ARCH_UNKNOWN;
 

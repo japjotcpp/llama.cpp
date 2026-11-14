@@ -1283,7 +1283,11 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         // tensors with "bias" suffix are always used with GGML_OP_ADD or GGML_OP_ADD_ID;
         // embedded-adapter ".lora_a"/".lora_b" tensors are always used with GGML_OP_MUL_MAT_ID
         ggml_op op;
-        if (tn.suffix != nullptr && strcmp(tn.suffix, "bias") == 0) {
+        if (tn.suffix != nullptr && strncmp(tn.suffix, "littlebit.", 10) == 0) {
+            // Packed factors/scales are graph inputs, not dense MUL_MAT weights.
+            // Preserve layer placement; the graph scheduler checks actual custom ops.
+            op = GGML_OP_NONE;
+        } else if (tn.suffix != nullptr && strcmp(tn.suffix, "bias") == 0) {
             op = info.op == GGML_OP_MUL_MAT_ID ? GGML_OP_ADD_ID : GGML_OP_ADD;
         } else if (hparams.router_layer >= 0 && tn.suffix != nullptr &&
                 (strcmp(tn.suffix, "lora_a") == 0 || strcmp(tn.suffix, "lora_b") == 0)) {
